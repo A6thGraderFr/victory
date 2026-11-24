@@ -1298,10 +1298,7 @@ impl HostList {
                     continue;
                 }
                 Step::Texture(staging, copy) => {
-                    if batch.texture_due(staging) {
-                        staging.refresh();
-                        batch.upload(staging, copy);
-                    }
+                    batch.texture(staging, copy);
                     continue;
                 }
             };
@@ -1319,11 +1316,15 @@ impl HostList {
 /// lists of a world submission sample the same textures, and a texture in
 /// physical-page memory is hashed whole each time it is checked. Checked
 /// once, it is checked again only after a step that writes title memory.
+/// The textures due are checked together when the buffers are, on several
+/// threads if there is enough to hash.
 #[derive(Default)]
 struct Batch {
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// Of those, the ones not refreshed yet, with their host copies.
+    due: Vec<Upload>,
     /// Textures whose host copies lack what their staging buffers hold,
     /// each once: copied before the submission's lists run.
     uploads: Vec<Upload>,
@@ -1346,6 +1347,18 @@ impl Batch {
     /// notes it refreshed).
     fn texture_due<T>(&mut self, staging: &std::sync::Arc<T>) -> bool {
         self.textures.insert(std::sync::Arc::as_ptr(staging) as *const () as usize)
+    }
+
+    /// A list samples a texture: refreshed at the next flush, unless it was
+    /// since the last title write.
+    fn texture(
+        &mut self,
+        staging: &std::sync::Arc<crate::texture::Staging>,
+        copy: &std::sync::Arc<crate::resource::HostTexture>,
+    ) {
+        if self.texture_due(staging) {
+            self.due.push((staging.clone(), copy.clone()));
+        }
     }
 
     /// After `staging`'s refresh: its host copy gets what the staging buffer
@@ -1383,6 +1396,14 @@ impl Batch {
             crate::copystat::range(from, to - from, us, 0);
             PREPARING[0].fetch_add(us, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+        }
+        if !self.due.is_empty() {
+            let due = std::mem::take(&mut self.due);
+            let stagings: Vec<&crate::texture::Staging> = due.iter().map(|(s, _)| &**s).collect();
+            crate::texture::refresh(&stagings);
+            for (staging, copy) in &due {
+                self.upload(staging, copy);
+            }
         }
     }
 }

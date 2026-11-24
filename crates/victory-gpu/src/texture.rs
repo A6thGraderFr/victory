@@ -45,6 +45,8 @@ pub(crate) struct Staging {
     /// Mips per array slice.
     mips: u32,
     memory: *const u8,
+    /// Whether the memory was write-watched at the last refresh.
+    watched: std::sync::atomic::AtomicBool,
     /// The title resource, for notes (diagnostics).
     #[cfg(feature = "diagnostics")]
     resource: usize,
@@ -234,24 +236,29 @@ impl Staging {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Detiles the texture memory into the staging buffer if it changed
-    /// since the last time (and is mapped at all).
-    pub(crate) fn refresh(&self) {
-        use std::sync::atomic::Ordering::Relaxed;
-        let started = std::time::Instant::now();
-        let read = self.refresh_now();
-        let preparing = &crate::host::PREPARING;
-        preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
-        preparing[3].fetch_add(read as u64, Relaxed);
+    /// About what refreshing the texture costs, in bytes to go through: the
+    /// whole memory if it is hashed (not write-watched, or not known yet),
+    /// next to nothing if it is watched and unchanged.
+    fn work(&self) -> u64 {
+        if self.watched.load(std::sync::atomic::Ordering::Relaxed) {
+            0
+        } else {
+            self.layout.size
+        }
     }
 
-    /// Returns the bytes of title memory read.
-    fn refresh_now(&self) -> usize {
+    /// Detiles the texture memory into the staging buffer if it changed
+    /// since the last time (and is mapped at all). Returns the bytes of
+    /// title memory read.
+    fn refresh(&self) -> usize {
         let size = self.layout.size as usize;
         let start = self.memory as usize;
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let last = &mut *last;
-        if let Some((now, written)) = crate::watch::writes(start, start + size, false) {
+        let watched = crate::watch::writes(start, start + size, false);
+        self.watched
+            .store(watched.is_some(), std::sync::atomic::Ordering::Relaxed);
+        if let Some((now, written)) = watched {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
             }
@@ -320,6 +327,68 @@ impl Staging {
             }
         }
     }
+}
+
+/// Brings the staging buffers of a submission's textures up to date
+/// (distinct ones, sampled since the last title write), on several threads
+/// when there is enough to go through: each texture's hashing and
+/// detiling reads its own memory and writes its own staging buffer (in
+/// physical-page views, which cannot be watched, every refresh hashes the
+/// whole memory).
+pub(crate) fn refresh(textures: &[&Staging]) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    let started = std::time::Instant::now();
+    let read = AtomicU64::new(0);
+    let work = textures.iter().map(|s| s.work()).sum();
+    each_on_threads(textures, threads(work, textures.len()), |s| {
+        read.fetch_add(s.refresh() as u64, Relaxed);
+    });
+    let preparing = &crate::host::PREPARING;
+    preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+    preparing[3].fetch_add(read.into_inner(), Relaxed);
+}
+
+/// Threads to refresh `count` textures on, going through `work` bytes.
+fn threads(work: u64, count: usize) -> usize {
+    static CORES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let cores = *CORES.get_or_init(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
+    threads_for(work, count, cores)
+}
+
+/// One thread per 4 MiB to go through (hashing that takes about a
+/// millisecond, starting a thread tens of microseconds), at most one per
+/// texture, per core and eight: memory bandwidth runs out before cores do.
+fn threads_for(work: u64, count: usize, cores: usize) -> usize {
+    const PER_THREAD: u64 = 4 << 20;
+    const MOST: usize = 8;
+    let most = count.min(cores).clamp(1, MOST);
+    usize::try_from(work / PER_THREAD)
+        .unwrap_or(usize::MAX)
+        .clamp(1, most)
+}
+
+/// Calls `each` on every item, on `threads` threads (the calling one among
+/// them), each taking the next item when it is done with one.
+fn each_on_threads<T: Sync>(items: &[T], threads: usize, each: impl Fn(&T) + Sync) {
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    let next = AtomicUsize::new(0);
+    let work = || {
+        while let Some(item) = items.get(next.fetch_add(1, Relaxed)) {
+            each(item);
+        }
+    };
+    if threads <= 1 {
+        return work();
+    }
+    std::thread::scope(|scope| {
+        for _ in 1..threads {
+            // One that does not start leaves its share to the others.
+            let _ = std::thread::Builder::new()
+                .name("victory-textures".into())
+                .spawn_scoped(scope, work);
+        }
+        work();
+    });
 }
 
 /// How many times `resource`'s host copy was given its staging buffer
@@ -412,6 +481,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         layout,
         mips: u32::from(d.MipLevels),
         memory,
+        watched: Default::default(),
         #[cfg(feature = "diagnostics")]
         resource: resource as usize,
         last: Mutex::default(),
@@ -424,7 +494,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 
 #[cfg(test)]
 mod tests {
-    use super::Copies;
+    use super::{Copies, each_on_threads, threads_for};
 
     #[test]
     fn a_host_texture_is_copied_once_per_new_contents() {
@@ -441,5 +511,65 @@ mod tests {
         copies.detiled();
         assert!(copies.take());
         assert!(!copies.take());
+    }
+
+    #[test]
+    fn every_texture_is_refreshed_once_on_any_number_of_threads() {
+        use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+        for (items, threads) in [(0, 1), (0, 4), (1, 8), (5, 1), (1000, 3), (1000, 8)] {
+            let seen: Vec<AtomicU32> = (0..items).map(|_| AtomicU32::new(0)).collect();
+            let indices: Vec<usize> = (0..items).collect();
+            each_on_threads(&indices, threads, |&i| {
+                seen[i].fetch_add(1, Relaxed);
+            });
+            let once = seen.iter().all(|n| n.load(Relaxed) == 1);
+            assert!(once, "{items} items on {threads} threads");
+        }
+    }
+
+    #[test]
+    fn threads_go_where_there_is_hashing_to_do() {
+        const MIB: u64 = 1 << 20;
+        // Little to go through (watched memory, small textures): this one.
+        assert_eq!(threads_for(0, 100, 16), 1);
+        assert_eq!(threads_for(7 * MIB, 100, 16), 1);
+        // One per 4 MiB ...
+        assert_eq!(threads_for(12 * MIB, 100, 16), 3);
+        // ... and at most one per texture, per core and eight.
+        assert_eq!(threads_for(1 << 30, 2, 16), 2);
+        assert_eq!(threads_for(1 << 30, 100, 4), 4);
+        assert_eq!(threads_for(1 << 30, 100, 64), 8);
+        assert_eq!(threads_for(1 << 30, 0, 0), 1);
+    }
+
+    /// What a submission's checks of textures in physical-page memory cost
+    /// (each hashed whole): one after another (before), and on the threads
+    /// a refresh of that much takes (after). Run with
+    /// `cargo test --release -p victory-gpu -- --ignored --nocapture texture_hashing`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn texture_hashing_on_threads() {
+        const TEXTURES: usize = 48;
+        const SIZE: usize = 4 << 20;
+        let textures: Vec<Vec<u8>> = (0..TEXTURES)
+            .map(|t| (0..SIZE).map(|i| (i * 31 + t) as u8).collect())
+            .collect();
+        let threads = super::threads((TEXTURES * SIZE) as u64, TEXTURES);
+        let hash_all = |threads: usize| {
+            let started = std::time::Instant::now();
+            each_on_threads(&textures, threads, |t| {
+                std::hint::black_box(blake3::hash(t));
+            });
+            started.elapsed()
+        };
+        hash_all(threads); // warm up
+        let before = hash_all(1);
+        let after = hash_all(threads);
+        println!(
+            "{TEXTURES} textures of {} MiB hashed: one thread {before:?}, {threads} threads \
+             {after:?} ({:.1}x)",
+            SIZE >> 20,
+            before.as_secs_f64() / after.as_secs_f64()
+        );
     }
 }
