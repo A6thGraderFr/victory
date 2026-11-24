@@ -4156,8 +4156,16 @@ impl<'a> Lower<'a> {
                     Some(&Operand::Scalar { code, .. }) => inst.read(Reg::S(code)),
                     _ => None,
                 };
+                // A lane mask, else a mask the same in every lane (SCC as
+                // all lanes or none, a constant).
+                let uniform = inst
+                    .writes
+                    .first()
+                    .and_then(|w| self.x.st.uniform_selects.get(&w.1));
                 let m = mask
-                    .and_then(|m| self.x.st.masks.get(&m).copied())
+                    .and_then(|m| self.x.st.masks.get(&m))
+                    .or(uniform)
+                    .copied()
                     .ok_or("a select on an untracked mask")?;
                 let cond = self.boolean(m, c)?;
                 if v.abs != 0 || v.neg != 0 {
@@ -7080,6 +7088,48 @@ mod tests {
         for words in [add, sub] {
             lowers(&words, 0).unwrap();
         }
+    }
+
+    #[test]
+    fn selects_on_masks_the_same_in_every_lane_need_no_lane_index() {
+        // The compilers' form of a select on a uniform condition: SCC as a
+        // mask of all lanes or none, then v_cndmask_b32 (here of the root
+        // constants s0 == s1); and constant masks. The result goes to LDS so
+        // the select is needed. Every lane picks the same source, so no lane
+        // index or wave operation is involved, in any stage.
+        let select = |mask: &[u32], wave64: bool| {
+            let mut words = vec![0xBF06_0100]; // s_cmp_eq_u32 s0, s1
+            words.extend_from_slice(mask);
+            words.extend_from_slice(&[
+                0xD501_0001,
+                0x000A_0080, // v_cndmask_b32 v1, 0, v0, s2 (s[2:3])
+                0xD834_0000,
+                0x0000_0100, // ds_write_b32 v0, v1
+                S_ENDPGM,
+            ]);
+            let layout = vec![
+                root(RootType::Constants, 0, 0),
+                root(RootType::Constants, 1, 1),
+            ];
+            lower_wave(&words, layout, vec![], wave64)
+        };
+        for (mask, wave64) in [
+            (0x8502_80C1, false), // s_cselect_b32 s2, -1, 0
+            (0x8502_C180, false), // s_cselect_b32 s2, 0, -1
+            (0xBE82_03C1, false), // s_mov_b32 s2, -1
+            (0xBE82_0380, false), // s_mov_b32 s2, 0
+            (0x8582_80C1, true),  // s_cselect_b64 s[2:3], -1, 0
+            (0xBE82_04C1, true),  // s_mov_b64 s[2:3], -1
+        ] {
+            let l = select(&[mask], wave64).unwrap_or_else(|e| panic!("{mask:#x}: {e}"));
+            assert!(!l.wave_ops, "{mask:#x}");
+        }
+        // A mask whose lanes differ, built from a number, is still refused.
+        let e = select(&[0x8F02_0081], false).err().unwrap(); // s_lshl_b32 s2, 1, s0
+        assert!(
+            e.to_string().contains("a select on an untracked mask"),
+            "{e}"
+        );
     }
 
     fn perm_features(selector: u32) -> u64 {
